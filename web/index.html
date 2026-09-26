@@ -111,8 +111,12 @@
       </div>
       <div class="field">
         <label for="jwk">Signing key (JWK)</label>
-        <input type="password" id="jwk" autocomplete="off"
-               placeholder="paste JWK — stored in this browser only" style="min-width:240px" />
+        <span style="display:flex; gap:6px; align-items:center">
+          <input type="password" id="jwk" autocomplete="off"
+                 placeholder="paste JWK — stored in this browser only" style="min-width:220px" />
+          <button type="button" id="jwk-show" title="Show / hide the key"
+                  style="padding:4px 10px; font-size:12px; cursor:pointer">show</button>
+        </span>
       </div>
       <div class="field">
         <label for="video">Video id</label>

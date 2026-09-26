@@ -39,6 +39,12 @@ relayInput.value = defaultRelay();
 jwkInput.value = getStoredJwk();
 relayInput.addEventListener("change", () => setStoredRelay(relayInput.value));
 jwkInput.addEventListener("change", () => setStoredJwk(jwkInput.value));
+const jwkShow = $<HTMLButtonElement>("jwk-show");
+jwkShow.addEventListener("click", () => {
+  const hidden = jwkInput.type === "password";
+  jwkInput.type = hidden ? "text" : "password";
+  jwkShow.textContent = hidden ? "hide" : "show";
+});
 const videoInput = $<HTMLInputElement>("video");
 const connectBtn = $<HTMLButtonElement>("connect");
 const statusEl = $<HTMLDivElement>("status");
