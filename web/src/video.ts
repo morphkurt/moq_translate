@@ -403,7 +403,7 @@ function fillEmbedded() {
   }
   embeddedField.style.display = "";
   embeddedSel.innerHTML =
-    `<option value="">— use .vtt file —</option>` +
+    `<option value="">— select subtitle track —</option>` +
     embeddedTracks
       .map((t) => {
         const name = LANG_NAMES[t.lang] ?? t.raw ?? t.lang;
@@ -411,11 +411,12 @@ function fillEmbedded() {
         return `<option value="${t.id}"${CODEC_SUPPORTED(t.codec) ? "" : " disabled"}>${name} — ${t.codec}${ok}</option>`;
       })
       .join("");
-  // Auto-select the first supported track so it works out of the box.
-  if (supported[0]) {
-    embeddedSel.value = String(supported[0].id);
-    void loadEmbedded(supported[0].id);
-  }
+  embeddedSel.value = ""; // wait for an explicit choice — do NOT parse captions until then
+  showHint(
+    srcFeed,
+    `${supported.length} embedded subtitle track${supported.length === 1 ? "" : "s"} found — ` +
+      `choose a language above (or load a .vtt file) to start.`,
+  );
 }
 
 async function loadEmbedded(trackId: number) {
