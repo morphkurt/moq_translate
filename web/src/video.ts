@@ -293,12 +293,19 @@ async function streamToMp4(
   stopWhen: () => boolean,
 ): Promise<void> {
   let pos = 0;
+  let guard = 0;
   while (!stopWhen() && pos < file.size) {
     const size = Math.min(CHUNK_BYTES, file.size - pos);
     const next = mp4.appendBuffer(await readChunk(file, pos, size));
     if (stopWhen()) break;
-    // mp4box returns the next byte it wants; a forward jump lets us skip regions it doesn't need.
-    pos = next > pos ? next : pos + size;
+    // Honor mp4box's requested next position: it jumps FORWARD past media it doesn't need, and
+    // BACKWARD to sample bytes when the moov is at the end of the file (non-faststart). If it asks
+    // for the same spot, advance a chunk so we never spin.
+    pos = next !== pos ? next : pos + size;
+    if (++guard > 20000) {
+      console.warn("mp4 stream: iteration guard hit; stopping");
+      break;
+    }
   }
   if (!stopWhen()) mp4.flush();
 }
