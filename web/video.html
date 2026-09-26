@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MoQ Video + WebVTT Translation</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --panel: #161b22;
+        --border: #30363d;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #58a6ff;
+        --good: #3fb950;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+      }
+      header { padding: 20px 28px; border-bottom: 1px solid var(--border); }
+      h1 { margin: 0 0 4px; font-size: 20px; }
+      header p { margin: 0; color: var(--muted); font-size: 14px; }
+      header a { color: var(--accent); }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: flex-end;
+        padding: 18px 28px;
+        border-bottom: 1px solid var(--border);
+      }
+      .field { display: flex; flex-direction: column; gap: 4px; }
+      .field label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+      input, select, button {
+        font-size: 14px;
+        padding: 8px 10px;
+        background: var(--panel);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
+      input[type="text"], input[type="url"] { min-width: 220px; }
+      button {
+        cursor: pointer;
+        background: var(--accent);
+        color: #04101f;
+        border-color: var(--accent);
+        font-weight: 600;
+      }
+      button:disabled { opacity: .5; cursor: default; }
+      #status { margin-left: auto; font-size: 13px; color: var(--muted); }
+      #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+      #status.connected .dot { background: var(--good); }
+
+      .main { display: grid; grid-template-columns: 1.4fr 1fr; gap: 1px; background: var(--border); min-height: 60vh; }
+      .col { background: var(--bg); display: flex; flex-direction: column; }
+      .col h2 {
+        margin: 0; padding: 12px 20px; font-size: 14px;
+        border-bottom: 1px solid var(--border);
+        display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      }
+      .col h2 .path { color: var(--muted); font-weight: 400; font-size: 12px; font-family: ui-monospace, monospace; }
+      .lang-select { padding: 4px 8px; font-size: 14px; font-weight: 600; }
+      .h2-actions { margin-left: auto; display: flex; gap: 8px; }
+      .clear-btn {
+        padding: 4px 10px; font-size: 12px; font-weight: 600;
+        background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+      }
+      .clear-btn:hover { color: var(--text); border-color: var(--muted); }
+      .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+      .lat { margin-left: auto; font-size: 12px; font-family: ui-monospace, monospace; color: var(--muted); }
+
+      .stage { position: relative; background: #000; padding: 16px 20px; }
+      video { width: 100%; max-height: 52vh; background: #000; border-radius: 6px; display: block; }
+      .overlay {
+        position: absolute; left: 20px; right: 20px; bottom: 28px;
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        pointer-events: none; text-align: center;
+      }
+      .ov-line { padding: 4px 12px; border-radius: 6px; background: rgba(0,0,0,.66); max-width: 90%; }
+      .ov-src { color: #c9d1d9; font-size: 15px; }
+      .ov-trans { color: #fff; font-size: 20px; font-weight: 600; }
+      .ov-line:empty { display: none; }
+
+      /* Fullscreen the whole stage (video + overlay) so both captions stay visible. */
+      .stage:fullscreen { display: flex; align-items: center; justify-content: center; padding: 0; }
+      .stage:fullscreen video { width: auto; height: 100vh; max-height: 100vh; max-width: 100vw; border-radius: 0; }
+      .stage:fullscreen .overlay { left: 4vw; right: 4vw; bottom: 6vh; }
+      .stage:fullscreen .ov-src { font-size: 2.6vh; }
+      .stage:fullscreen .ov-trans { font-size: 3.6vh; }
+
+      .feed { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+      .cue { animation: fade .3s ease; }
+      .cue .seq { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; margin-right: 8px; }
+      .cue.latest { color: var(--accent); }
+      .cue .lat-badge { margin-left: 8px; font-size: 11px; font-family: ui-monospace, monospace; }
+      .cue .llm-badge { color: var(--accent); }
+      .lat-good { color: var(--good); }
+      .lat-ok { color: #d29922; }
+      .lat-slow { color: #f85149; }
+      .hint { color: var(--muted); font-style: italic; }
+      @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+      .note { padding: 8px 28px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>MoQ Video + WebVTT Translation</h1>
+      <p>Load a video with captions — a WebVTT file <em>or</em> subtitle tracks embedded in the MP4
+        (multiple languages supported). Cues are <strong>published to MoQ as a source</strong> as the
+        video plays; a translated track is attached as a subscriber after the LLM translates it.
+        &nbsp;<a href="index.html">&larr; synthetic-caption demo</a></p>
+    </header>
+
+    <div class="note" id="run-note"></div>
+
+    <div class="controls">
+      <div class="field">
+        <label for="relay">Relay</label>
+        <input type="url" id="relay" value="https://cdn.moq.pro/pk54jf2kv65wn" />
+      </div>
+      <div class="field">
+        <label for="jwk">Signing key (JWK)</label>
+        <input type="password" id="jwk" autocomplete="off"
+               placeholder="paste JWK — stored in this browser only" style="min-width:260px" />
+      </div>
+      <div class="field">
+        <label for="video-id">Video id</label>
+        <input type="text" id="video-id" value="vtt1" style="min-width: 100px" />
+      </div>
+      <div class="field">
+        <label for="video-url">Video URL</label>
+        <input type="url" id="video-url" placeholder="https://…​.mp4 (or use file)" />
+      </div>
+      <div class="field">
+        <label for="video-file">Video file</label>
+        <input type="file" id="video-file" accept="video/*" />
+      </div>
+      <div class="field">
+        <label for="vtt-file">WebVTT file</label>
+        <input type="file" id="vtt-file" accept=".vtt,text/vtt" />
+      </div>
+      <div class="field" id="embedded-field" style="display:none">
+        <label for="embedded-track">Embedded subtitles</label>
+        <select class="lang-select" id="embedded-track"></select>
+      </div>
+      <div class="field">
+        <label for="src-lang">Caption language</label>
+        <select class="lang-select" id="src-lang" data-default="en"></select>
+      </div>
+      <div class="field">
+        <label for="tgt-lang">Translate to</label>
+        <select class="lang-select" id="tgt-lang" data-default="es"></select>
+      </div>
+      <button id="connect" disabled>Connect &amp; Publish</button>
+      <div id="status"><span class="dot"></span><span class="txt">disconnected</span></div>
+    </div>
+
+    <div class="main">
+      <div class="col">
+        <h2>
+          <span class="lbl">Player</span>
+          <span class="path" id="src-path"></span>
+          <span class="h2-actions">
+            <button id="fullscreen" class="clear-btn" title="Fullscreen with both captions">⛶ Fullscreen</button>
+            <button id="clear-left" class="clear-btn" title="Clear the published-caption log">Clear</button>
+          </span>
+        </h2>
+        <div class="stage" id="stage">
+          <video id="video" controls playsinline></video>
+          <div class="overlay">
+            <div class="ov-line ov-src" id="ov-src"></div>
+            <div class="ov-line ov-trans" id="ov-trans"></div>
+          </div>
+        </div>
+        <div class="feed" id="src-feed"><div class="hint">Load a video and a .vtt file to begin.</div></div>
+      </div>
+      <div class="col">
+        <h2>
+          <span class="lbl">Translated</span>
+          <span class="path" id="tgt-path"></span>
+          <span class="lat" id="tgt-lat"></span>
+          <button id="clear-right" class="clear-btn" style="margin-left:8px" title="Clear the translation log">Clear</button>
+        </h2>
+        <div class="feed" id="tgt-feed"><div class="hint">Translated cues appear here.</div></div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/video.ts"></script>
+  </body>
+</html>

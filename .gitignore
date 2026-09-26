@@ -1,0 +1,16 @@
+# Secrets — NEVER commit the signing key or any minted tokens
+/keys/
+*.jwk
+*.jwt
+
+# Rust
+/target
+
+# Node / web
+**/node_modules
+web/dist
+web/.vite
+
+# misc
+.DS_Store
+*.log
