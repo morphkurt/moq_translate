@@ -1,16 +1,15 @@
 //! Pivot translation service.
 //!
-//! Subscribes to several native source streams (`<video_id>/captions/<src>`) and, for every
-//! source→target pair, serves `<video_id>/translations/<src>-<tgt>`. Any language can be a
-//! target, including English — e.g. read the Spanish cooking stream in English via
-//! `translations/es-en`.
+//! Subscribes to several native source streams (`<video_id>/captions/<src>`) and serves
+//! `<video_id>/translations/<src>-<tgt>` on demand. Any language can be a target, including English
+//! — e.g. read the Spanish cooking stream in English via `translations/es-en`.
 //!
-//! Two levels of laziness keep the relay and GPU quiet:
-//! - **Announce is lazy**: a pair's translation broadcast is only created, announced, and primed
-//!   once its *source* actually starts publishing. Nothing is advertised for a source nobody is
-//!   sending (so `pt-en` never appears unless something publishes `captions/pt`).
-//! - **Translation is lazy**: even for an announced pair, the LLM only runs while that pair has a
-//!   live subscriber (`demand.is_used()`).
+//! Nothing speculative is advertised. Instead of announcing every source×target pair up front, the
+//! publish side advertises a single dynamic route for the `<video_id>/translations` subtree and
+//! **materializes a pair only when a consumer actually subscribes to it** — so a pair we are not
+//! translating (e.g. `pt-fr` that nobody is watching) never appears in the namespace at all. On top
+//! of that, even a materialized pair only runs the LLM while it has a live subscriber
+//! (`demand.is_used()`), and the GPU is driven by a single serialized worker.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use moq_translate::{caption_path, client, lang_name, translation_path, Cue, Ollama, TRACK};
+use moq_translate::{caption_path, client, lang_name, Cue, Ollama, TRACK};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use url::Url;
 
@@ -86,13 +85,119 @@ async fn main() -> Result<()> {
         senders.insert(src.clone(), broadcast::channel::<Cue>(256).0);
     }
 
-    // Publish side. Translation broadcasts are added to this origin LAZILY, from inside each source's
-    // consume task, only once the source is live — so we never advertise pairs for an absent source.
+    // Publish side: advertise the translations subtree as ONE dynamic route and serve each pair on
+    // demand. Nothing under it exists until a consumer subscribes to a specific `<src>-<tgt>` path.
     let pub_origin = moq_tokio::origin::spawn();
     let _conn_pub = client
         .clone()
         .publish(pub_origin.consume())
         .expect("relay url configured");
+
+    {
+        let prefix = format!("{}/translations", args.video_id);
+        let dynamic = pub_origin.dynamic(&prefix, Default::default())?;
+        let senders = senders.clone();
+        let job_tx = job_tx.clone();
+        let sources = args.sources.clone();
+        let targets = args.targets.clone();
+        tokio::spawn(async move {
+            loop {
+                let req = match dynamic.requested_broadcast().await {
+                    Ok(req) => req,
+                    Err(_) => break, // origin driver gone
+                };
+                let path = req.path().to_string();
+                // Path is `<video_id>/translations/<src>-<tgt>`; pull the `<src>-<tgt>` off the end.
+                let pair = path.rsplit('/').next().unwrap_or("");
+                let (src, tgt) = match pair.split_once('-') {
+                    Some((s, t)) => (s.to_string(), t.to_string()),
+                    None => continue, // malformed → drop the request (auto-rejects)
+                };
+                // Only serve pairs we actually support; anything else is dropped (auto-rejected).
+                if src == tgt || !sources.contains(&src) || !targets.contains(&tgt) {
+                    continue;
+                }
+                let sender = match senders.get(&src) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let broadcast = moq_net::broadcast::Info::new().produce();
+                let track = match broadcast.create_track(TRACK, None) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        eprintln!("serve {path} track error: {err:#}");
+                        continue;
+                    }
+                };
+                let mut producer =
+                    moq_json::stream::Producer::new(track, moq_json::stream::Config::default());
+                let demand = producer.demand();
+                req.accept(&broadcast); // hand the requester a consumer; we keep producing into it
+                println!("serving {path}");
+
+                let mut rx = sender.subscribe();
+                let jobs = job_tx.clone();
+                let src_name = lang_name(&src);
+                let tgt_name = lang_name(&tgt);
+                tokio::spawn(async move {
+                    let _broadcast = broadcast; // keep the served broadcast alive
+                    // Prime so the relay advertises a route and the viewer sees immediate feedback.
+                    let _ = producer.append(&Cue {
+                        seq: 0,
+                        start_ms: 0,
+                        end_ms: 0,
+                        text: format!("[{src_name}→{tgt_name} ready]"),
+                        lang: tgt.clone(),
+                        origin_ts_ms: 0,
+                        translate_ms: 0,
+                    });
+                    loop {
+                        let cue = match rx.recv().await {
+                            Ok(cue) => cue,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+                        if !demand.is_used() {
+                            continue; // lazy: subscriber went away
+                        }
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let job = Job {
+                            text: cue.text.clone(),
+                            source: src_name.clone(),
+                            target: tgt_name.clone(),
+                            reply: reply_tx,
+                        };
+                        if jobs.send(job).await.is_err() {
+                            break; // worker gone
+                        }
+                        let (translated, translate_ms) = match reply_rx.await {
+                            Ok(Ok(v)) => v,
+                            Ok(Err(err)) => {
+                                eprintln!("[{src}->{tgt}] translate error: {err}");
+                                continue;
+                            }
+                            Err(_) => continue,
+                        };
+                        let out = Cue {
+                            seq: cue.seq,
+                            start_ms: cue.start_ms,
+                            end_ms: cue.end_ms,
+                            text: translated,
+                            lang: tgt.clone(),
+                            origin_ts_ms: cue.origin_ts_ms,
+                            translate_ms,
+                        };
+                        println!("[{src}->{tgt} #{} {}ms] {}", out.seq, translate_ms, out.text);
+                        if let Err(err) = producer.append(&out) {
+                            eprintln!("[{src}->{tgt}] append error: {err:#}");
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     // Consume side: subscribe to each native source and fan its cues into that source's channel.
     let sub_origin = moq_tokio::origin::spawn();
@@ -104,17 +209,11 @@ async fn main() -> Result<()> {
         let path = caption_path(&args.video_id, src);
         let sender = senders[src].clone();
         let sub_origin = sub_origin.clone();
-        let pub_origin = pub_origin.clone();
-        let job_tx = job_tx.clone();
-        let targets = args.targets.clone();
-        let video_id = args.video_id.clone();
         let src = src.clone();
         tokio::spawn(async move {
-            let mut announced = false;
-            // Outer loop makes the subscription self-healing: a browser publisher that reloads,
-            // seeks, or reconnects aborts the single MoQ group it streams into, which surfaces here
-            // as a read/subscribe error. Rather than ending the task (which permanently halts every
-            // translation for this source), re-request the broadcast and resume.
+            // Self-healing: a browser publisher that reloads/seeks/reconnects aborts the group it
+            // streams into, surfacing here as a read/subscribe error. Re-request and resume rather
+            // than ending the task (which would stall every translation from this source).
             loop {
                 let broadcast = loop {
                     match sub_origin.consume().request_broadcast(&path).await {
@@ -125,107 +224,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 };
-
-                // The source is routable now → lazily announce this source's translation pairs, once.
-                // A source that never appears advertises nothing.
-                if !announced {
-                    announced = true;
-                    let src_name = lang_name(&src);
-                    for tgt in &targets {
-                        if tgt == &src {
-                            continue;
-                        }
-                        let tpath = translation_path(&video_id, &src, tgt);
-                        let broadcast = match pub_origin.create_broadcast(&tpath) {
-                            Ok(b) => b,
-                            Err(err) => {
-                                eprintln!("pair {src}->{tgt} create error: {err:#}");
-                                continue;
-                            }
-                        };
-                        if let Err(err) = broadcast.announce(Default::default()) {
-                            eprintln!("pair {src}->{tgt} announce error: {err:#}");
-                            continue;
-                        }
-                        let track = match broadcast.create_track(TRACK, None) {
-                            Ok(t) => t,
-                            Err(err) => {
-                                eprintln!("pair {src}->{tgt} track error: {err:#}");
-                                continue;
-                            }
-                        };
-                        let producer =
-                            moq_json::stream::Producer::new(track, moq_json::stream::Config::default());
-                        let demand = producer.demand();
-
-                        let mut rx = sender.subscribe();
-                        let jobs = job_tx.clone();
-                        let src = src.clone();
-                        let src_name = src_name.clone();
-                        let tgt = tgt.clone();
-                        let tgt_name = lang_name(&tgt);
-                        println!("announced {tpath}");
-
-                        tokio::spawn(async move {
-                            let _broadcast = broadcast;
-                            let mut producer = producer;
-                            // Prime the broadcast so the relay advertises a route (see README).
-                            let _ = producer.append(&Cue {
-                                seq: 0,
-                                start_ms: 0,
-                                end_ms: 0,
-                                text: format!("[{src_name}→{tgt_name} ready]"),
-                                lang: tgt.clone(),
-                                origin_ts_ms: 0,
-                                translate_ms: 0,
-                            });
-                            loop {
-                                let cue = match rx.recv().await {
-                                    Ok(cue) => cue,
-                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                };
-                                if !demand.is_used() {
-                                    continue; // lazy: nobody watching this pair
-                                }
-                                // Hand the work to the singleton GPU worker and wait our turn.
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let job = Job {
-                                    text: cue.text.clone(),
-                                    source: src_name.clone(),
-                                    target: tgt_name.clone(),
-                                    reply: reply_tx,
-                                };
-                                if jobs.send(job).await.is_err() {
-                                    break; // worker gone
-                                }
-                                let (translated, translate_ms) = match reply_rx.await {
-                                    Ok(Ok(v)) => v,
-                                    Ok(Err(err)) => {
-                                        eprintln!("[{src}->{tgt}] translate error: {err}");
-                                        continue;
-                                    }
-                                    Err(_) => continue, // worker dropped the reply
-                                };
-                                let out = Cue {
-                                    seq: cue.seq,
-                                    start_ms: cue.start_ms,
-                                    end_ms: cue.end_ms,
-                                    text: translated,
-                                    lang: tgt.clone(),
-                                    origin_ts_ms: cue.origin_ts_ms,
-                                    translate_ms,
-                                };
-                                println!("[{src}->{tgt} #{} {}ms] {}", out.seq, translate_ms, out.text);
-                                if let Err(err) = producer.append(&out) {
-                                    eprintln!("[{src}->{tgt}] append error: {err:#}");
-                                    break;
-                                }
-                            }
-                        });
-                    }
-                }
-
                 let track = match broadcast.track(TRACK) {
                     Ok(t) => t,
                     Err(err) => {
@@ -250,8 +248,6 @@ async fn main() -> Result<()> {
                         Ok(Some(cue)) => {
                             let _ = sender.send(cue);
                         }
-                        // Stream ended or errored: fall out to the outer loop and re-subscribe so a
-                        // republished source (new group) is picked up instead of stalling here.
                         Ok(None) => {
                             eprintln!("source {src} stream ended; re-subscribing");
                             break;
