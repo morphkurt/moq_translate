@@ -89,7 +89,7 @@ const ovTrans = $<HTMLDivElement>("ov-trans");
 // ---- state -------------------------------------------------------------------
 
 let origin: Moq.Origin.Producer | undefined;
-let connection: Awaited<ReturnType<typeof Moq.Connection.connect>> | undefined;
+let connection: Moq.Connection | undefined;
 
 let srcBroadcast: Moq.Broadcast.Producer | undefined;
 let srcProducer: Stream.Producer<Cue> | undefined;
@@ -453,24 +453,23 @@ async function openCuesTrack(path: string): Promise<Moq.Track.Subscriber> {
   return active.track("cues").subscribe({ priority: 0 });
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Read cues from one subscription until it ends/errors. Returns so the caller can re-subscribe. */
 async function pumpTranslation(sub: Moq.Track.Subscriber, gen: number) {
   const consumer = new Stream.Consumer<Cue>({ track: sub });
-  try {
-    for (;;) {
-      const cue = await consumer.next();
-      if (!cue || gen !== tgtGen) break;
-      appendCue(tgtFeed, cue, tgtLat);
-      if (!/\bready\]$/.test(cue.text)) {
-        setOverlay(ovTrans, cue.text);
-        // Hide it when the playhead passes the original end time, delayed by however long this line
-        // took to arrive, with a readable floor. Cleared by `publishDue` on the next tick/seek.
-        const lat = cue.origin_ts_ms ? Math.max(0, Date.now() - cue.origin_ts_ms) : 0;
-        const nowMs = video.currentTime * 1000;
-        transHideAt = Math.max((cue.end_ms || nowMs) + lat, nowMs + MIN_TRANS_SHOW_MS);
-      }
+  for (;;) {
+    const cue = await consumer.next();
+    if (!cue || gen !== tgtGen) break;
+    appendCue(tgtFeed, cue, tgtLat);
+    if (!/\bready\]$/.test(cue.text)) {
+      setOverlay(ovTrans, cue.text);
+      // Hide it when the playhead passes the original end time, delayed by however long this line
+      // took to arrive, with a readable floor. Cleared by `publishDue` on the next tick/seek.
+      const lat = cue.origin_ts_ms ? Math.max(0, Date.now() - cue.origin_ts_ms) : 0;
+      const nowMs = video.currentTime * 1000;
+      transHideAt = Math.max((cue.end_ms || nowMs) + lat, nowMs + MIN_TRANS_SHOW_MS);
     }
-  } catch (err) {
-    if (gen === tgtGen) console.error("translation pump error:", err);
   }
 }
 
@@ -489,13 +488,23 @@ async function subscribeTranslation() {
   const path = `${videoId()}/translations/${src}-${tgt}`;
   tgtPath.textContent = path;
   showHint(tgtFeed, "waiting for translator (first LLM output may take a moment)…");
-  try {
-    const sub = await openCuesTrack(path);
-    if (gen !== tgtGen) return sub.close();
-    tgtSub = sub;
-    void pumpTranslation(sub, gen);
-  } catch (err) {
-    if (gen === tgtGen) showHint(tgtFeed, `translator not available (${err})`);
+
+  // Re-attach across relay blips: openCuesTrack subscribes blindly, so once the connection redials
+  // and the translator re-announces the route, the next attempt resolves and cues resume.
+  while (gen === tgtGen && origin) {
+    try {
+      const sub = await openCuesTrack(path);
+      if (gen !== tgtGen) {
+        sub.close();
+        return;
+      }
+      tgtSub = sub;
+      await pumpTranslation(sub, gen);
+    } catch (err) {
+      if (gen === tgtGen) console.warn("translation subscription dropped; retrying:", err);
+    }
+    if (gen !== tgtGen) return;
+    await sleep(1000); // brief backoff before re-subscribing while the route re-establishes
   }
 }
 
@@ -516,8 +525,10 @@ async function connectAndPublish() {
   }
   try {
     origin = new Moq.Origin.Producer();
-    // One origin, both directions: publish our source and consume the peer's translations.
-    connection = await Moq.Connection.connect({ url, publish: origin.consume(), consume: origin });
+    // Self-reconnecting connection (share:false so it carries our own origins). On a relay blip it
+    // redials and re-announces our published source automatically; the translation subscribe loop
+    // below re-attaches once the route is back — so an outage recovers without a manual reconnect.
+    connection = new Moq.Connection({ url, publish: origin.consume(), consume: origin, share: false });
   } catch (err) {
     setStatus(`connect failed: ${err}`, false);
     connectBtn.disabled = false;
@@ -613,6 +624,11 @@ function publishDue() {
   // Show the source caption for the current window regardless of publish/connection state.
   setOverlay(ovSrc, active ? cues[idx].text : "");
 
+  // While actively seeking/scrubbing, only update the overlay — never publish. A fast scrub crosses
+  // many cues; publishing each would flood the wire and swamp the singleton GPU worker. The 'seeked'
+  // handler publishes the settled position once, debounced.
+  if (video.seeking) return;
+
   if (!srcProducer) return;
   if (idx === lastPublishedIdx) return; // already sent the current cue
   lastPublishedIdx = idx; // advance even when skipping, so a scrubbed-past cue is never sent late
@@ -696,8 +712,16 @@ tgtSel.addEventListener("change", () => {
 });
 
 video.addEventListener("timeupdate", publishDue);
-// Publish is playhead-driven, so a seek just needs an immediate re-evaluation at the new position.
-video.addEventListener("seeked", publishDue);
+// During a scrub the source overlay follows along (publishDue returns early while `video.seeking`),
+// but publishing is deferred: only after seeks stop for `SEEK_DEBOUNCE_MS` do we publish the settled
+// cue once — so a fast scrub across the timeline doesn't dump every cue it passes onto the wire.
+const SEEK_DEBOUNCE_MS = 250;
+let seekDebounce: number | undefined;
+video.addEventListener("seeking", publishDue);
+video.addEventListener("seeked", () => {
+  clearTimeout(seekDebounce);
+  seekDebounce = window.setTimeout(publishDue, SEEK_DEBOUNCE_MS);
+});
 
 // Clearing the source also clears the translation on the video: the original line is gone, so its
 // translated overlay should go with it. In-flight (delayed) translations still arrive normally.

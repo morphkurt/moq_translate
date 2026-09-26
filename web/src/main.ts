@@ -53,7 +53,8 @@ const leftLat = $<HTMLSpanElement>("left-lat");
 const rightLat = $<HTMLSpanElement>("right-lat");
 
 let origin: Moq.Origin.Producer | undefined;
-let connection: Awaited<ReturnType<typeof Moq.Connection.connect>> | undefined;
+let connection: Moq.Connection | undefined;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let leftGen = 0;
 let rightGen = 0;
@@ -123,14 +124,33 @@ async function pump(
   latEl?: HTMLSpanElement,
 ) {
   const consumer = new Stream.Consumer<Cue>({ track: sub });
-  try {
-    for (;;) {
-      const cue = await consumer.next();
-      if (!cue || isStale()) break;
-      appendCue(feed, cue, latEl);
+  for (;;) {
+    const cue = await consumer.next();
+    if (!cue || isStale()) break;
+    appendCue(feed, cue, latEl);
+  }
+}
+
+/** Subscribe and read a feed, re-attaching across relay blips until `isStale()` (a fresh gen). */
+async function runFeed(
+  path: string,
+  feed: HTMLDivElement,
+  isStale: () => boolean,
+  latEl?: HTMLSpanElement,
+) {
+  while (!isStale() && origin) {
+    let sub: Moq.Track.Subscriber | undefined;
+    try {
+      sub = await openCuesTrack(path);
+      if (isStale()) return;
+      await pump(sub, feed, isStale, latEl);
+    } catch (err) {
+      if (!isStale()) console.warn(`feed ${path} dropped; retrying:`, err);
+    } finally {
+      sub?.close();
     }
-  } catch (err) {
-    if (!isStale()) console.error("pump error:", err);
+    if (isStale()) return;
+    await sleep(1000); // brief backoff while the connection/route re-establishes
   }
 }
 
@@ -168,14 +188,7 @@ async function subscribeLeft() {
   const path = `${videoId()}/captions/${src}`;
   leftPath.textContent = path;
   showHint(leftFeed, "waiting for source…");
-  try {
-    const sub = await openCuesTrack(path);
-    if (gen !== leftGen) return sub.close();
-    leftSub = sub;
-    pump(sub, leftFeed, () => gen !== leftGen, leftLat);
-  } catch (err) {
-    if (gen === leftGen) showHint(leftFeed, `source not available (${err})`);
-  }
+  void runFeed(path, leftFeed, () => gen !== leftGen, leftLat);
 }
 
 async function subscribeRight() {
@@ -197,14 +210,7 @@ async function subscribeRight() {
   const path = `${videoId()}/translations/${src}-${tgt}`;
   rightPath.textContent = path;
   showHint(rightFeed, "sent intent — waiting for translator (first LLM output may take a moment)…");
-  try {
-    const sub = await openCuesTrack(path);
-    if (gen !== rightGen) return sub.close();
-    rightSub = sub;
-    pump(sub, rightFeed, () => gen !== rightGen, rightLat);
-  } catch (err) {
-    if (gen === rightGen) showHint(rightFeed, `translator not available (${err})`);
-  }
+  void runFeed(path, rightFeed, () => gen !== rightGen, rightLat);
 }
 
 async function connect() {
@@ -223,7 +229,8 @@ async function connect() {
   }
   try {
     origin = new Moq.Origin.Producer();
-    connection = await Moq.Connection.connect({ url, consume: origin });
+    // Self-reconnecting connection: an outage recovers on its own, and the feed loops re-attach.
+    connection = new Moq.Connection({ url, consume: origin, share: false });
   } catch (err) {
     setStatus(`connect failed: ${err}`, false);
     connectBtn.disabled = false;
