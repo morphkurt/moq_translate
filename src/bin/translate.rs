@@ -48,7 +48,9 @@ struct Args {
     targets: Vec<String>,
     #[arg(long, default_value = "http://192.168.88.144:11434")]
     ollama: Url,
-    #[arg(long, default_value = "gemma3:4b")]
+    // TranslateGemma (translation-specialized Gemma, 300+ languages) — far better than base gemma3:4b
+    // for low-resource targets like Sinhala, same ~840ms warm latency, fits the 6GB GPU.
+    #[arg(long, default_value = "translategemma:4b")]
     model: String,
 }
 
